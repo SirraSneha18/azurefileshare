@@ -3,6 +3,7 @@ package runner
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"text/template"
 
 	"github.com/opencontainers/selinux/go-selinux"
 
@@ -157,6 +159,113 @@ func (rc *RunContext) GetBindsAndMounts() ([]string, map[string]string) {
 	return binds, mounts
 }
 
+var startTemplate = template.Must(template.New("start").Parse(`#!/bin/sh -xe
+lxc-create --name="{{.Name}}" --template={{.Template}} -- --release {{.Release}} $packages
+tee -a /var/lib/lxc/{{.Name}}/config <<'EOF'
+security.nesting = true
+lxc.cap.drop =
+lxc.apparmor.profile = unconfined
+#
+# /dev/net (docker won't work without /dev/net/tun)
+#
+lxc.cgroup2.devices.allow = c 10:200 rwm
+lxc.mount.entry = /dev/net dev/net none bind,create=dir 0 0
+#
+# /dev/kvm (libvirt / kvm won't work without /dev/kvm)
+#
+lxc.cgroup2.devices.allow = c 10:232 rwm
+lxc.mount.entry = /dev/kvm dev/kvm none bind,create=file 0 0
+#
+# /dev/loop
+#
+lxc.cgroup2.devices.allow = c 10:237 rwm
+lxc.cgroup2.devices.allow = b 7:* rwm
+lxc.mount.entry = /dev/loop-control dev/loop-control none bind,create=file 0 0
+#
+# /dev/mapper
+#
+lxc.cgroup2.devices.allow = c 10:236 rwm
+lxc.mount.entry = /dev/mapper dev/mapper none bind,create=dir 0 0
+#
+# /dev/fuse
+#
+lxc.cgroup2.devices.allow = b 10:229 rwm
+lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0
+EOF
+
+mkdir -p /var/lib/lxc/{{.Name}}/rootfs/{{ .Root }}
+mount --bind {{ .Root }} /var/lib/lxc/{{.Name}}/rootfs/{{ .Root }}
+
+mkdir /var/lib/lxc/{{.Name}}/rootfs/tmpdir
+mount --bind {{.TmpDir}} /var/lib/lxc/{{.Name}}/rootfs/tmpdir
+
+lxc-start {{.Name}}
+lxc-wait --name {{.Name}} --state RUNNING
+
+#
+# Wait for the network to come up
+#
+cat > /var/lib/lxc/{{.Name}}/rootfs/tmpdir/networking.sh <<'EOF'
+#!/bin/sh -xe
+for d in $(seq 60); do
+  getent hosts wikipedia.org > /dev/null && break
+  sleep 1
+done
+getent hosts wikipedia.org
+EOF
+chmod +x /var/lib/lxc/{{.Name}}/rootfs/tmpdir/networking.sh
+
+lxc-attach --name {{.Name}} -- /tmpdir/networking.sh
+
+cat > /var/lib/lxc/{{.Name}}/rootfs/tmpdir/node.sh <<'EOF'
+#!/bin/sh -xe
+# https://github.com/nodesource/distributions#debinstall
+apt-get install -y curl git
+curl -fsSL https://deb.nodesource.com/setup_16.x | bash -
+apt-get install -y nodejs
+EOF
+chmod +x /var/lib/lxc/{{.Name}}/rootfs/tmpdir/node.sh
+
+lxc-attach --name {{.Name}} -- /tmpdir/node.sh
+
+`))
+
+var stopTemplate = template.Must(template.New("stop").Parse(`#!/bin/sh -x
+lxc-ls -1 --filter="^{{.Name}}" | while read container ; do
+   lxc-stop --kill --name="$container"
+   umount "/var/lib/lxc/$container/rootfs/{{ .Root }}"
+   umount "/var/lib/lxc/$container/rootfs/tmpdir"
+   lxc-destroy --force --name="$container"
+done
+`))
+
+func (rc *RunContext) stopHostEnvironment() common.Executor {
+	return func(ctx context.Context) error {
+		logger := common.Logger(ctx)
+		logger.Debugf("stopHostEnvironment")
+
+		var stopScript bytes.Buffer
+		if err := stopTemplate.Execute(&stopScript, struct {
+			Name string
+			Root string
+		}{
+			Name: rc.JobContainer.GetName(),
+			Root: rc.JobContainer.GetRoot(),
+		}); err != nil {
+			return err
+		}
+
+		return common.NewPipelineExecutor(
+			rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", &container.FileEntry{
+				Name: "workflow/stop-lxc.sh",
+				Mode: 0755,
+				Body: stopScript.String(),
+			}),
+			rc.JobContainer.Exec([]string{rc.JobContainer.GetActPath() + "/workflow/stop-lxc.sh"}, map[string]string{}, "root", rc.Config.Workdir),
+		)(ctx)
+	}
+}
+
 func (rc *RunContext) startHostEnvironment() common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
@@ -172,7 +281,8 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		cacheDir := rc.ActionCacheDir()
 		randBytes := make([]byte, 8)
 		_, _ = rand.Read(randBytes)
-		miscpath := filepath.Join(cacheDir, hex.EncodeToString(randBytes))
+		randName := hex.EncodeToString(randBytes)
+		miscpath := filepath.Join(cacheDir, randName)
 		actPath := filepath.Join(miscpath, "act")
 		if err := os.MkdirAll(actPath, 0o777); err != nil {
 			return err
@@ -187,6 +297,8 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 		}
 		toolCache := filepath.Join(cacheDir, "tool_cache")
 		rc.JobContainer = &container.HostEnvironment{
+			Name:      randName,
+			Root:      miscpath,
 			Path:      path,
 			TmpDir:    runnerTmp,
 			ToolCache: toolCache,
@@ -212,7 +324,34 @@ func (rc *RunContext) startHostEnvironment() common.Executor {
 			}
 		}
 
+		var startScript bytes.Buffer
+		if err := startTemplate.Execute(&startScript, struct {
+			Name     string
+			Template string
+			Release  string
+			Repo     string
+			Root     string
+			TmpDir   string
+			Script   string
+		}{
+			Name:     rc.JobContainer.GetName(),
+			Template: "debian",
+			Release:  "bullseye",
+			Repo:     "", // step.Environment["CI_REPO"],
+			Root:     rc.JobContainer.GetRoot(),
+			TmpDir:   runnerTmp,
+			Script:   "", // "commands-" + step.Name,
+		}); err != nil {
+			return err
+		}
+
 		return common.NewPipelineExecutor(
+			rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", &container.FileEntry{
+				Name: "workflow/start-lxc.sh",
+				Mode: 0755,
+				Body: startScript.String(),
+			}),
+			rc.JobContainer.Exec([]string{rc.JobContainer.GetActPath() + "/workflow/start-lxc.sh"}, map[string]string{}, "root", rc.Config.Workdir),
 			rc.JobContainer.Copy(rc.JobContainer.GetActPath()+"/", &container.FileEntry{
 				Name: "workflow/event.json",
 				Mode: 0o644,
@@ -429,12 +568,22 @@ func (rc *RunContext) IsHostEnv(ctx context.Context) bool {
 }
 
 func (rc *RunContext) stopContainer() common.Executor {
-	return rc.stopJobContainer()
+	return func(ctx context.Context) error {
+		image := rc.platformImage(ctx)
+		if strings.EqualFold(image, "-self-hosted") {
+			return rc.stopHostEnvironment()(ctx)
+		}
+		return rc.stopJobContainer()(ctx)
+	}
 }
 
 func (rc *RunContext) closeContainer() common.Executor {
 	return func(ctx context.Context) error {
 		if rc.JobContainer != nil {
+			image := rc.platformImage(ctx)
+			if strings.EqualFold(image, "-self-hosted") {
+				return rc.stopHostEnvironment()(ctx)
+			}
 			return rc.JobContainer.Close()(ctx)
 		}
 		return nil
